@@ -1,0 +1,125 @@
+name: Build and publish model images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "models/**"
+      - ".github/workflows/build-models.yml"
+  workflow_dispatch:
+    inputs:
+      models:
+        description: "Space-separated model directory names to build (empty = all)"
+        required: false
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      models: ${{ steps.find.outputs.models }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed model directories
+        id: find
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          INPUT_MODELS: ${{ inputs.models }}
+        run: |
+          set -euo pipefail
+
+          all_models() {
+            for d in models/*/; do
+              [ -f "${d}Dockerfile" ] && basename "$d"
+            done
+          }
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            if [ -n "$INPUT_MODELS" ]; then
+              list=$(printf '%s\n' $INPUT_MODELS)
+            else
+              list=$(all_models)
+            fi
+          elif [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+               || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            # first push / force push: build everything
+            list=$(all_models)
+          elif git diff --name-only "$BEFORE" "$AFTER" | grep -qx '.github/workflows/build-models.yml'; then
+            # workflow itself changed: rebuild everything
+            list=$(all_models)
+          else
+            list=$(git diff --name-only "$BEFORE" "$AFTER" \
+              | grep '^models/' | cut -d/ -f2 | sort -u || true)
+          fi
+
+          # keep only dirs that still exist and have a Dockerfile (skip deleted models)
+          json=$(for m in $list; do
+                   [ -f "models/$m/Dockerfile" ] && echo "$m"
+                 done | jq -R . | jq -sc .)
+          [ -z "$json" ] && json='[]'
+
+          echo "models=$json" >> "$GITHUB_OUTPUT"
+          echo "Models to build: $json"
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.models != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        model: ${{ fromJSON(needs.detect.outputs.models) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image name
+        id: name
+        run: |
+          # GHCR requires lowercase repository paths
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          model=$(echo "${{ matrix.model }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=${{ env.REGISTRY }}/${owner}/${model}" >> "$GITHUB_OUTPUT"
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.name.outputs.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: models/${{ matrix.model }}
+          file: models/${{ matrix.model }}/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # optional: raises HF download rate limits / gated models (only the discarded builder stage sees it)
+          build-args: |
+            HF_TOKEN=${{ secrets.HF_TOKEN }}
+          cache-from: type=gha,scope=${{ matrix.model }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.model }}
